@@ -6,11 +6,21 @@ use {
     ndarray::{Array1, Array2, Array3, Array4},
     ort::{
         inputs,
-        session::{RunOptions, Session},
+        session::{RunOptions, Session, builder::SessionBuilder},
         value::{Tensor, TensorRef, Value},
     },
     std::path::Path,
 };
+
+pub(super) fn get_session_builder() -> Result<SessionBuilder, TtsError> {
+    let builder = Session::builder()?;
+    #[cfg(feature = "cuda")]
+    let builder = builder.with_execution_providers(&[
+        ort::execution_providers::CUDAExecutionProvider::default().build(),
+    ])?;
+
+    Ok(builder)
+}
 
 /// KV cache: one (key, value) pair per transformer layer.
 pub(super) type KvCache = Vec<(Array4<f32>, Array4<f32>)>;
@@ -30,22 +40,22 @@ impl Sessions {
     where
         P: AsRef<Path>,
     {
-        let prefill = Session::builder()?
+        let prefill = get_session_builder()?
             .commit_from_file(model_dir.as_ref().join("moss_tts_prefill.onnx"))?;
-        let decode_step = Session::builder()?
+        let decode_step = get_session_builder()?
             .commit_from_file(model_dir.as_ref().join("moss_tts_decode_step.onnx"))?;
-        let local_fixed_sampled_frame = Session::builder()?.commit_from_file(
+        let local_fixed_sampled_frame = get_session_builder()?.commit_from_file(
             model_dir
                 .as_ref()
                 .join("moss_tts_local_fixed_sampled_frame.onnx"),
         )?;
-        let local_cached_step = Session::builder()?
+        let local_cached_step = get_session_builder()?
             .commit_from_file(model_dir.as_ref().join("moss_tts_local_cached_step.onnx"))?;
 
-        let codec_encode = Session::builder()?
+        let codec_encode = get_session_builder()?
             .commit_from_file(codec_dir.as_ref().join("moss_audio_tokenizer_encode.onnx"))?;
 
-        let codec_decode_step = Session::builder()?.commit_from_file(
+        let codec_decode_step = get_session_builder()?.commit_from_file(
             codec_dir
                 .as_ref()
                 .join("moss_audio_tokenizer_decode_step.onnx"),
