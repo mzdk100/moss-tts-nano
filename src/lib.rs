@@ -17,10 +17,10 @@ use {
         EndOfSpeechDetector, build_next_row, create_numpy_compatible_rng, generate_frame_fixed,
         generate_frame_full,
     },
-    models::{Sessions, run_decode_step, run_prefill},
+    models::{Sessions, encode_ref, run_decode_step, run_prefill},
     ndarray::{Array2, Array3},
     sampling::SamplingConfig,
-    std::{collections::HashSet, pin::Pin},
+    std::{collections::HashSet, path::Path, pin::Pin},
     tokenizer::Tokenizer,
 };
 
@@ -45,6 +45,47 @@ impl MossTtsNano {
     /// Create a builder with default settings.
     pub fn builder() -> MossTtsNanoBuilder {
         MossTtsNanoBuilder::new()
+    }
+
+    /// Switch to a built-in voice preset **without reloading any models**.
+    ///
+    /// A voice is fully determined by its reference codes; for a preset these
+    /// are copied from the already-loaded config, so this is effectively
+    /// instantaneous. Returns [`TtsError::Config`] if `name` is not a known
+    /// built-in voice (the current voice is left unchanged in that case).
+    pub async fn set_voice<S>(&mut self, name: S) -> Result<(), TtsError>
+    where
+        S: AsRef<str>,
+    {
+        let name = name.as_ref();
+        match builder::resolve_preset_codes(&self.app_config, name) {
+            Some(codes) => {
+                self.ref_codes = Some(codes);
+                Ok(())
+            }
+            None => Err(TtsError::Config(format!(
+                "built-in voice '{name}' not found"
+            ))),
+        }
+    }
+
+    /// Switch to a cloned voice from reference audio **without reloading the
+    /// transformer/codec models**.
+    ///
+    /// Only the reference codes are recomputed, by running the already-loaded
+    /// codec encoder over `path`. This is far cheaper than rebuilding the engine
+    /// (a single short encode pass rather than loading every ONNX session).
+    pub async fn set_prompt_audio<P>(&mut self, path: P) -> Result<(), TtsError>
+    where
+        P: AsRef<Path>,
+    {
+        let waveform =
+            builder::load_wav_stereo(path, self.app_config.codec_config.sample_rate).await?;
+        let codes = encode_ref(&mut self.sessions.codec_encode, &waveform)
+            .await
+            .map_err(|e| TtsError::Config(e.to_string()))?;
+        self.ref_codes = Some(codes);
+        Ok(())
     }
 
     /// Synthesize speech from text, returning interleaved f32 samples.

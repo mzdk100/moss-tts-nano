@@ -115,43 +115,28 @@ impl MossTtsNanoBuilder {
         let tokenizer_path = model_dir.join("tokenizer.model");
         let tokenizer = Tokenizer::open(&tokenizer_path).await?;
 
-        // Resolve reference audio codes
+        // Resolve reference audio codes. Both paths are cheap relative to model
+        // loading and are shared with the live setters on `MossTtsNano`.
         let ref_codes: Option<Array3<i32>> = if let Some(ref path) = self.prompt_audio_path {
-            let waveform = Self::load_wav_stereo(path, app_config.codec_config.sample_rate).await?;
+            let waveform = load_wav_stereo(path, app_config.codec_config.sample_rate).await?;
             let codes = encode_ref(&mut sessions.codec_encode, &waveform)
                 .await
                 .map_err(|e| TtsError::Config(e.to_string()))?;
             Some(codes)
         } else {
-            match app_config
-                .builtin_voices
-                .iter()
-                .find(|v| v.name == self.voice)
-            {
-                Some(voice) => {
-                    let n_vq = app_config.tts_config.n_vq;
-                    let nf = voice.codes.len();
-                    let mut codes = Array3::<i32>::zeros((1, nf, n_vq));
-                    for (f, frame) in voice.codes.iter().enumerate() {
-                        for (ch, &val) in frame.iter().enumerate().take(n_vq) {
-                            codes[[0, f, ch]] = val;
-                        }
-                    }
-                    Some(codes)
-                }
-                None => {
-                    let available: Vec<&str> = app_config
-                        .builtin_voices
-                        .iter()
-                        .map(|v| v.name.as_str())
-                        .collect();
-                    eprintln!(
-                        "Warning: voice '{}' not found. Available: {:?}",
-                        self.voice, available
-                    );
-                    None
-                }
+            let codes = resolve_preset_codes(&app_config, &self.voice);
+            if codes.is_none() {
+                let available: Vec<&str> = app_config
+                    .builtin_voices
+                    .iter()
+                    .map(|v| v.name.as_str())
+                    .collect();
+                eprintln!(
+                    "Warning: voice '{}' not found. Available: {:?}",
+                    self.voice, available
+                );
             }
+            codes
         };
 
         let sample_rate = app_config.codec_config.sample_rate;
@@ -169,45 +154,68 @@ impl MossTtsNanoBuilder {
             channels,
         })
     }
+}
 
-    async fn load_wav_stereo<P>(path: P, target_sr: u32) -> Result<Array2<f32>, TtsError>
-    where
-        P: AsRef<Path>,
-    {
-        // Load stereo (mono=false) at 48kHz
-        let (interleaved, channels) = match target_sr {
-            16000 => load_audio::<16000, f32, _>(path, false).await,
-            22050 => load_audio::<22050, f32, _>(path, false).await,
-            24000 => load_audio::<24000, f32, _>(path, false).await,
-            32000 => load_audio::<32000, f32, _>(path, false).await,
-            44100 => load_audio::<44100, f32, _>(path, false).await,
-            48000 => load_audio::<48000, f32, _>(path, false).await,
-            _ => return Err(TtsError::Config("Unsupported sample rate".into())),
-        }?;
-
-        let num_samples = interleaved.len() / channels;
-
-        // Deinterleave to [channels, samples]
-        let mut ch_audio: Vec<Vec<f32>> = (0..channels)
-            .map(|_| Vec::with_capacity(num_samples))
-            .collect();
-        for (i, &s) in interleaved.iter().enumerate() {
-            ch_audio[i % channels].push(s);
+/// Resolve a built-in voice preset name to its reference codes.
+///
+/// This is just an array copy from the loaded config — no ONNX inference — so it
+/// is reused by [`MossTtsNano::set_voice`](super::MossTtsNano::set_voice) to
+/// switch presets without rebuilding the engine. Returns `None` if no preset
+/// matches `voice`.
+pub(super) fn resolve_preset_codes(app_config: &AppConfig, voice: &str) -> Option<Array3<i32>> {
+    let preset = app_config.builtin_voices.iter().find(|v| v.name == voice)?;
+    let n_vq = app_config.tts_config.n_vq;
+    let nf = preset.codes.len();
+    let mut codes = Array3::<i32>::zeros((1, nf, n_vq));
+    for (f, frame) in preset.codes.iter().enumerate() {
+        for (ch, &val) in frame.iter().enumerate().take(n_vq) {
+            codes[[0, f, ch]] = val;
         }
-
-        // Take first two channels (or duplicate mono)
-        let (left, right) = if channels >= 2 {
-            (ch_audio[0].clone(), ch_audio[1].clone())
-        } else {
-            (ch_audio[0].clone(), ch_audio[0].clone())
-        };
-
-        let (left, right) = (Array1::from_vec(left), Array1::from_vec(right));
-
-        let len = left.len();
-        let mut wf = Array2::<f32>::zeros((2, len));
-        wf.row_mut(0).assign(&left);
-        wf.row_mut(1).assign(&right);
-        Ok(wf)
     }
+    Some(codes)
+}
+
+/// Load reference audio as a 2-channel `[2, samples]` waveform at `target_sr`.
+///
+/// Shared by the builder and by
+/// [`MossTtsNano::set_prompt_audio`](super::MossTtsNano::set_prompt_audio).
+pub(super) async fn load_wav_stereo<P>(path: P, target_sr: u32) -> Result<Array2<f32>, TtsError>
+where
+    P: AsRef<Path>,
+{
+    // Load stereo (mono=false) at 48kHz
+    let (interleaved, channels) = match target_sr {
+        16000 => load_audio::<16000, f32, _>(path, false).await,
+        22050 => load_audio::<22050, f32, _>(path, false).await,
+        24000 => load_audio::<24000, f32, _>(path, false).await,
+        32000 => load_audio::<32000, f32, _>(path, false).await,
+        44100 => load_audio::<44100, f32, _>(path, false).await,
+        48000 => load_audio::<48000, f32, _>(path, false).await,
+        _ => return Err(TtsError::Config("Unsupported sample rate".into())),
+    }?;
+
+    let num_samples = interleaved.len() / channels;
+
+    // Deinterleave to [channels, samples]
+    let mut ch_audio: Vec<Vec<f32>> = (0..channels)
+        .map(|_| Vec::with_capacity(num_samples))
+        .collect();
+    for (i, &s) in interleaved.iter().enumerate() {
+        ch_audio[i % channels].push(s);
+    }
+
+    // Take first two channels (or duplicate mono)
+    let (left, right) = if channels >= 2 {
+        (ch_audio[0].clone(), ch_audio[1].clone())
+    } else {
+        (ch_audio[0].clone(), ch_audio[0].clone())
+    };
+
+    let (left, right) = (Array1::from_vec(left), Array1::from_vec(right));
+
+    let len = left.len();
+    let mut wf = Array2::<f32>::zeros((2, len));
+    wf.row_mut(0).assign(&left);
+    wf.row_mut(1).assign(&right);
+    Ok(wf)
 }
